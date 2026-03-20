@@ -136,6 +136,13 @@ input:focus,select:focus{border-color:var(--accent);}
 .prompt-expand-btn{background:var(--surface2);border:1px solid var(--border);color:var(--text2);font-size:10px;padding:2px 7px;border-radius:5px;cursor:pointer;}
 .prompt-expand-btn:hover{border-color:var(--text2);color:var(--text);}
 .char-count{font-size:9px;color:var(--text2);text-align:right;margin-top:2px;}
+.search-toggle{display:flex;align-items:center;gap:7px;background:var(--surface2);border:1px solid var(--border);border-radius:20px;padding:4px 10px;cursor:pointer;user-select:none;transition:border-color .2s;}
+.search-toggle:hover{border-color:var(--text2);}
+.search-toggle.active{border-color:#38bdf8;background:#38bdf811;}
+.search-toggle-dot{width:8px;height:8px;border-radius:50%;background:var(--border);transition:background .2s;}
+.search-toggle.active .search-toggle-dot{background:#38bdf8;}
+.search-toggle-label{font-size:11px;color:var(--text2);transition:color .2s;}
+.search-toggle.active .search-toggle-label{color:#38bdf8;}
 </style>
 </head>
 <body>
@@ -153,6 +160,10 @@ input:focus,select:focus{border-color:var(--accent);}
     </div>
     <button class="icon-btn" onclick="openConfig()">⚙️</button>
     <button class="icon-btn" onclick="createNewSession()">➕</button>
+    <div class="search-toggle" id="searchToggle" onclick="toggleWebSearch()" title="Activar búsqueda web en tiempo real">
+      <div class="search-toggle-dot"></div>
+      <span class="search-toggle-label">🌐 Web</span>
+    </div>
   </div>
 </header>
 
@@ -264,7 +275,7 @@ RESPONSE STYLE: 3-5 oraciones. Directo. Sin rodeos. Cuestiona supuestos. Aporta 
   {id:'custom',name:'Agente 4',model:'',provider:'openai-compat',apiKey:'',role:'Abogado del diablo',color:'#f472b6',emoji:'🟡',active:false,synthesizer:false,
    systemPrompt:`Eres el abogado del diablo. Identifica riesgos y falacias. Cuestiona supuestos. Sé constructivamente crítico. 3-5 oraciones máximo.`},
 ];
-let docs=[], messages=[], round=0, mode='panel', running=false, debateMode='collaborative', proxyActive=false;
+let docs=[], messages=[], round=0, mode='panel', running=false, debateMode='collaborative', proxyActive=false, webSearch=false;
 let sessions=[], currentSessionId=null;
 
 // ══════════════════════════════════════════════════════════════
@@ -596,25 +607,28 @@ function buildSystem(ag){
 // ══════════════════════════════════════════════════════════════
 async function callAnthropic(ag,msgs,ctx){
   const headers={'Content-Type':'application/json','anthropic-version':'2023-06-01'};
-  // Solo añadir x-api-key si hay key manual; el proxy la añade si no
   if(ag.apiKey) headers['x-api-key']=ag.apiKey;
-  const r=await fetch(PROXY.anthropic+'/v1/messages',{
-    method:'POST',
-    headers,
-    body:JSON.stringify({model:ag.model||'claude-sonnet-4-6',max_tokens:800,system:buildSystem(ag)+ctx,messages:msgs})
-  });
+  const body={model:ag.model||'claude-sonnet-4-6',max_tokens:800,system:buildSystem(ag)+ctx,messages:msgs};
+  // Web search nativo de Anthropic
+  if(webSearch) body.tools=[{type:'web_search_20250305',name:'web_search'}];
+  const r=await fetch(PROXY.anthropic+'/v1/messages',{method:'POST',headers,body:JSON.stringify(body)});
   const d=await r.json();
   if(d.error)throw new Error(d.error.message);
-  return d.content[0].text;
+  // Extraer solo los bloques de texto (puede haber tool_use/tool_result entre medias)
+  const textBlocks=d.content.filter(b=>b.type==='text').map(b=>b.text);
+  if(!textBlocks.length) throw new Error('Sin respuesta de texto');
+  return textBlocks.join('\n');
 }
 async function callOpenAI(ag,msgs,ctx){
   const base=ag.provider==='openai-compat'?(ag.baseUrl||'https://api.openai.com'):PROXY.openai;
   const headers={'Content-Type':'application/json'};
   if(ag.apiKey) headers['Authorization']='Bearer '+ag.apiKey;
+  // Web search nativo: cambiar a modelo search-preview
+  const model=webSearch&&ag.provider==='openai'?'gpt-4o-search-preview':(ag.model||'gpt-4o');
   const r=await fetch(base+'/v1/chat/completions',{
     method:'POST',
     headers,
-    body:JSON.stringify({model:ag.model||'gpt-4o',max_tokens:800,messages:[{role:'system',content:buildSystem(ag)+ctx},...msgs]})
+    body:JSON.stringify({model,max_tokens:800,messages:[{role:'system',content:buildSystem(ag)+ctx},...msgs]})
   });
   const d=await r.json();
   if(d.error)throw new Error(d.error.message);
@@ -623,11 +637,10 @@ async function callOpenAI(ag,msgs,ctx){
 async function callGemini(ag,msgs,ctx){
   const url=`${PROXY.google}/v1beta/models/${ag.model||'gemini-2.0-flash'}:generateContent?key=${ag.apiKey}`;
   const contents=msgs.map(m=>({role:m.role==='assistant'?'model':'user',parts:[{text:m.content}]}));
-  const r=await fetch(url,{
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({system_instruction:{parts:[{text:buildSystem(ag)+ctx}]},contents})
-  });
+  const body={system_instruction:{parts:[{text:buildSystem(ag)+ctx}]},contents};
+  // Web search nativo: Google Search grounding
+  if(webSearch) body.tools=[{googleSearch:{}}];
+  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   const d=await r.json();
   if(d.error)throw new Error(d.error.message||JSON.stringify(d.error));
   return d.candidates[0].content.parts[0].text;
@@ -657,6 +670,11 @@ function setDebateMode(m){
   debateMode=m;
   document.getElementById('debateCollab').classList.toggle('active',m==='collaborative');
   document.getElementById('debateAdvers').classList.toggle('active',m==='adversarial');
+}
+function toggleWebSearch(){
+  webSearch=!webSearch;
+  const el=document.getElementById('searchToggle');
+  el.classList.toggle('active',webSearch);
 }
 
 // ══════════════════════════════════════════════════════════════
